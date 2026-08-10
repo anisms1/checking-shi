@@ -1,0 +1,150 @@
+"""
+VERIFICATION STEP 1 — the original flat-vol backtest, from your master sheet
+============================================================================
+Reads ONE Excel file:
+    column A = date
+    column B = SPY spot
+    column C = 100%-moneyness (ATM) implied vol     <- used for EVERYTHING here
+    column D = 90%-moneyness implied vol            <- ignored in this step
+
+What it runs (all with ONE flat vol per day, no skew, zero trading costs,
+1 straddle per month, per-contract dollars):
+
+    unhedged     short 30-day ATM straddle, delta-hedged daily
+    put@90pct    same + buy one 90%-of-spot put each month (priced at ATM vol)
+    put@85pct    same at 85%
+    put@80pct    same at 80%
+    put@75pct    same at 75%
+
+Output: one comparison table. Trades CSVs are saved quietly (v1_trades_*.csv)
+so later verification steps can reuse them. No charts.
+
+Run:  python verify_step1_flat.py
+"""
+import os
+import numpy as np
+import pandas as pd
+from scipy.stats import norm
+
+# ----------------------------------------------------------------------
+INPUT_PATH  = "my_data.xlsx"    # <-- your master sheet (.xlsx or .csv)
+RATE        = 0.04
+TENOR_DAYS  = 30
+MULT        = 100
+PUT_PCTS    = [None, 0.90, 0.85, 0.80, 0.75]   # None = unhedged
+HEDGE_WITH_DAILY_IV = True
+# ----------------------------------------------------------------------
+
+def d1(S, K, T, r, iv):
+    return (np.log(S / K) + (r + 0.5 * iv**2) * T) / (iv * np.sqrt(T))
+
+def bs_put(S, K, T, r, iv):
+    a = d1(S, K, T, r, iv); b = a - iv * np.sqrt(T)
+    return K * np.exp(-r * T) * norm.cdf(-b) - S * norm.cdf(-a)
+
+def put_delta(S, K, T, r, iv):
+    return norm.cdf(d1(S, K, T, r, iv)) - 1.0
+
+def straddle_price(S, K, T, r, iv):
+    a = d1(S, K, T, r, iv); b = a - iv * np.sqrt(T)
+    return (S * norm.cdf(a) - K * np.exp(-r * T) * norm.cdf(b)
+            + K * np.exp(-r * T) * norm.cdf(-b) - S * norm.cdf(-a))
+
+def straddle_delta(S, K, T, r, iv):
+    return 2.0 * norm.cdf(d1(S, K, T, r, iv)) - 1.0
+
+# ---- load: first 3 columns of your master sheet -----------------------
+ext = os.path.splitext(INPUT_PATH)[1].lower()
+raw = (pd.read_excel(INPUT_PATH) if ext in (".xlsx", ".xls")
+       else pd.read_csv(INPUT_PATH)).iloc[:, :3]
+raw.columns = ["date", "spot", "iv"]
+raw["date"] = pd.to_datetime(raw["date"])
+raw["spot"] = pd.to_numeric(raw["spot"], errors="coerce")
+raw["iv"]   = pd.to_numeric(raw["iv"],   errors="coerce")
+df = (raw.dropna()
+         .loc[lambda d: d["date"].dt.dayofweek < 5]
+         .drop_duplicates(subset="date").sort_values("date").reset_index(drop=True))
+if df["iv"].median() > 3:                       # percent -> decimal
+    df["iv"] = df["iv"] / 100.0
+    print("Detected percent units in the vol column — divided by 100.")
+print(f"Loaded {len(df)} trading days: {df.date.iloc[0].date()} to {df.date.iloc[-1].date()}"
+      f"  |  median ATM vol {df['iv'].median():.1%}")
+
+def run(df, put_pct):
+    cash, shares, pos, anchor = 0.0, 0, None, 0.0
+    trade_rows = []
+    equity_path = []
+    for _, row in df.iterrows():
+        today, S, iv = row["date"], row["spot"], row["iv"]
+
+        # settle at (or after) expiry
+        if pos is not None and today >= pos["expiry"]:
+            cash -= MULT * abs(S - pos["K"])
+            put_payout = 0.0
+            if pos["Kp"] is not None:
+                put_payout = MULT * max(pos["Kp"] - S, 0.0)
+                cash += put_payout
+            trade_rows.append({"entry_date": pos["entry_date"].date(),
+                               "expiry_date": today.date(),
+                               "premium": pos["premium"], "put_cost": pos["put_cost"],
+                               "put_payout": put_payout,
+                               "trade_pnl": (cash + shares * S) - anchor})
+            pos = None
+
+        # open new trade
+        if pos is None:
+            anchor = cash + shares * S
+            K, T0 = S, TENOR_DAYS / 365.0
+            premium = MULT * straddle_price(S, K, T0, RATE, iv)
+            cash += premium
+            Kp, put_cost = None, 0.0
+            if put_pct is not None:
+                Kp = S * put_pct
+                put_cost = MULT * bs_put(S, Kp, T0, RATE, iv)   # flat: SAME vol
+                cash -= put_cost
+            pos = {"entry_date": today, "K": K, "Kp": Kp,
+                   "expiry": today + pd.Timedelta(days=TENOR_DAYS),
+                   "premium": premium, "put_cost": put_cost, "iv0": iv}
+
+        # daily delta hedge (no costs)
+        T = max((pos["expiry"] - today).days / 365.0, 1.0 / 365.0)
+        iv_h = iv if HEDGE_WITH_DAILY_IV else pos["iv0"]
+        net = straddle_delta(S, pos["K"], T, RATE, iv_h)
+        if pos["Kp"] is not None:
+            net -= put_delta(S, pos["Kp"], T, RATE, iv_h)
+        target = round(MULT * net)
+        cash -= (target - shares) * S
+        shares = target
+
+        # mark to market
+        liab = MULT * straddle_price(S, pos["K"], T, RATE, iv)
+        pv = MULT * bs_put(S, pos["Kp"], T, RATE, iv) if pos["Kp"] is not None else 0.0
+        equity_path.append(cash + shares * S - liab + pv)
+
+    return pd.DataFrame(trade_rows), pd.Series(equity_path, index=df["date"][:len(equity_path)])
+
+def label(p): return "unhedged" if p is None else f"put@{int(p*100)}pct"
+
+results = {}
+for p in PUT_PCTS:
+    trades, eq = run(df, p)
+    trades.to_csv(f"v1_trades_{label(p)}.csv", index=False)
+    results[label(p)] = (trades, eq)
+
+# ---- the table --------------------------------------------------------
+names = list(results)
+print("\n===== STEP 1: FLAT VOL, NO COSTS, 1 STRADDLE/MONTH (per-contract $) =====")
+print(f"{'':24s}" + "".join(f"{n:>14s}" for n in names))
+def rowp(lbl, fn, fmt="{:>14,.0f}"):
+    print(f"{lbl:24s}" + "".join(fmt.format(fn(*results[n])) for n in names))
+rowp("Completed trades",     lambda t, e: len(t))
+rowp("Total P&L ($)",        lambda t, e: e.iloc[-1])
+rowp("Avg trade P&L ($)",    lambda t, e: t["trade_pnl"].mean())
+rowp("Avg premium ($/mo)",   lambda t, e: t["premium"].mean())
+rowp("Avg put cost ($/mo)",  lambda t, e: t["put_cost"].mean())
+rowp("Win rate",             lambda t, e: (t["trade_pnl"] > 0).mean(), "{:>14.1%}")
+rowp("Worst trade ($)",      lambda t, e: t["trade_pnl"].min())
+rowp("Max drawdown ($)",     lambda t, e: (e - e.cummax()).min())
+rowp("Sharpe (~ann.)",       lambda t, e: t["trade_pnl"].mean()/t["trade_pnl"].std()*np.sqrt(12), "{:>14.2f}")
+rowp("Months put paid off",  lambda t, e: (t["put_payout"] > 0).sum())
+print("\nSaved: v1_trades_*.csv  (for later verification steps)")
