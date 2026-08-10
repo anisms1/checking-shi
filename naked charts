@@ -46,7 +46,9 @@ import pandas as pd
 DATA_SOURCE = "demo"                 # "demo" | "excel" | "bloomberg"
 EXCEL_FILE  = "spy_vols.xlsx"
 EXCEL_COLS  = dict(atm=("A", "B"), m90=("D", "E"), px=("G", "H"))
-PNL_CSV     = "backtest_pnl.csv"     # date, pnl_flat, pnl_real
+PNL_FILE    = "backtest_pnl.xlsx"    # .xlsx or .csv from the backtest
+PNL_SHEET   = 0                      # sheet name or index (xlsx only)
+PNL_COLS    = dict(date="date", flat="pnl_flat", real="pnl_real")  # your column headers
 START, END  = "2008-01-01", None     # END=None -> today
 OUT_DIR     = Path("charts")
 
@@ -174,10 +176,18 @@ def load_demo():
 def load_pnl(df):
     """Monthly backtest P&L: real file if present, else simulated from the vol
     series (short straddle keeps carry, loses when realized outruns implied)."""
-    p = Path(PNL_CSV)
+    p = Path(PNL_FILE)
     if p.exists():
-        pnl = pd.read_csv(p, parse_dates=["date"]).set_index("date").sort_index()
-        return pnl[["pnl_flat", "pnl_real"]]
+        if p.suffix.lower() in (".xlsx", ".xlsm", ".xls"):
+            raw = pd.read_excel(p, sheet_name=PNL_SHEET)
+        else:
+            raw = pd.read_csv(p)
+        raw.columns = [str(c).strip() for c in raw.columns]
+        pnl = pd.DataFrame({
+            "pnl_flat": raw[PNL_COLS["flat"]].values,
+            "pnl_real": raw[PNL_COLS["real"]].values,
+        }, index=pd.to_datetime(raw[PNL_COLS["date"]]))
+        return pnl.sort_index().dropna()
 
     rng = np.random.default_rng(11)
     rv = np.log(df["px"]).diff().rolling(21).std() * np.sqrt(252) * 100
