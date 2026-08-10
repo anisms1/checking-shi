@@ -1,0 +1,180 @@
+"""
+STEP 2 — EXTRA CHARTS: what the flat-vol assumption hid
+=======================================================
+Self-contained (reads INPUT_PATH, re-runs what it needs). Produces:
+
+  step2_insurance_vs_flat.png
+      Monthly insurance bill for the 85% and 90% puts, REAL skewed vol vs
+      the old FLAT ATM-vol assumption, with cumulative totals below.
+      The shaded gap is exactly what the constant-IV assumption hid.
+
+  step2_hedge_net_cost.png
+      The running NET cost of each hedge: unhedged equity minus hedged
+      equity. Rises in calm months (premium bleeding away), plunges in
+      crashes (the put paying you back). The end value is what 18 years
+      of insurance truly cost after refunds — compare it to the gross
+      spend to see the recovery rate.
+
+Run:  python verify_step2_charts2.py
+"""
+import os
+import numpy as np
+import pandas as pd
+from scipy.stats import norm
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+# ----------------------------------------------------------------------
+INPUT_PATH      = "my_data.xlsx"     # <-- your master sheet
+RATE            = 0.04
+TENOR_DAYS      = 30
+MULT            = 100
+TARGET_PREMIUM  = 1000.0
+HEDGE_COST_BP   = 0.1
+# ----------------------------------------------------------------------
+
+BLUE, ORANGE, VIOLET, RED = "#2a78d6", "#eb6834", "#4a3aa7", "#e34948"
+AQUA, GRAY, GRID, INK = "#1baf7a", "#898781", "#e1e0d9", "#0b0b0b"
+
+def style(ax):
+    ax.grid(alpha=0.55, lw=0.5, color=GRID)
+    ax.spines[["top", "right"]].set_visible(False)
+    ax.spines[["left", "bottom"]].set_color("#c3c2b7")
+    ax.tick_params(colors=GRAY, labelsize=9)
+
+def d1(S, K, T, r, iv):
+    return (np.log(S / K) + (r + 0.5 * iv**2) * T) / (iv * np.sqrt(T))
+def bs_put(S, K, T, r, iv):
+    a = d1(S, K, T, r, iv); b = a - iv * np.sqrt(T)
+    return K * np.exp(-r * T) * norm.cdf(-b) - S * norm.cdf(-a)
+def put_delta(S, K, T, r, iv):
+    return norm.cdf(d1(S, K, T, r, iv)) - 1.0
+def straddle_price(S, K, T, r, iv):
+    a = d1(S, K, T, r, iv); b = a - iv * np.sqrt(T)
+    return (S * norm.cdf(a) - K * np.exp(-r * T) * norm.cdf(b)
+            + K * np.exp(-r * T) * norm.cdf(-b) - S * norm.cdf(-a))
+def straddle_delta(S, K, T, r, iv):
+    return 2.0 * norm.cdf(d1(S, K, T, r, iv)) - 1.0
+
+ext = os.path.splitext(INPUT_PATH)[1].lower()
+raw = (pd.read_excel(INPUT_PATH) if ext in (".xlsx", ".xls")
+       else pd.read_csv(INPUT_PATH)).iloc[:, :4]
+raw.columns = ["date", "spot", "iv_atm", "iv90"]
+raw["date"] = pd.to_datetime(raw["date"])
+for c in ["spot", "iv_atm", "iv90"]:
+    raw[c] = pd.to_numeric(raw[c], errors="coerce")
+df = (raw.dropna().loc[lambda d: d["date"].dt.dayofweek < 5]
+         .drop_duplicates(subset="date").sort_values("date").reset_index(drop=True))
+if df["iv_atm"].median() > 3:
+    df[["iv_atm", "iv90"]] = df[["iv_atm", "iv90"]] / 100.0
+df["slope"] = ((df["iv90"] - df["iv_atm"]).clip(lower=0)) / 0.10
+
+def vol_at(S, K, iv_atm, slope):
+    return iv_atm + slope * max(0.0, 1.0 - K / S)
+
+def run(df, put_pct):
+    """Skewed-vol backtest; also records what the put WOULD have cost at flat vol."""
+    cash, shares, pos, anchor = 0.0, 0, None, 0.0
+    trade_rows, eq_rows = [], []
+    for _, row in df.iterrows():
+        today, S = row["date"], row["spot"]
+        iv_t, slope_t = row["iv_atm"], row["slope"]
+        if pos is not None and today >= pos["expiry"]:
+            q = pos["qty"]
+            cash -= q * MULT * abs(S - pos["K"])
+            if pos["Kp"] is not None:
+                cash += q * MULT * max(pos["Kp"] - S, 0.0)
+            trade_rows.append({"entry_date": pos["entry_date"],
+                               "put_cost": pos["put_cost"],
+                               "put_cost_flat": pos["put_cost_flat"],
+                               "trade_pnl": (cash + shares * S) - anchor})
+            pos = None
+        if pos is None:
+            anchor = cash + shares * S
+            K, T0 = S, TENOR_DAYS / 365.0
+            qty = TARGET_PREMIUM / (straddle_price(S, K, T0, RATE, iv_t) * MULT)
+            cash += TARGET_PREMIUM
+            Kp, pc, pcf = None, 0.0, 0.0
+            if put_pct is not None:
+                Kp = S * put_pct
+                pc  = qty * MULT * bs_put(S, Kp, T0, RATE, vol_at(S, Kp, iv_t, slope_t))
+                pcf = qty * MULT * bs_put(S, Kp, T0, RATE, iv_t)     # flat, same size
+                cash -= pc
+            pos = {"entry_date": today, "K": K, "Kp": Kp, "qty": qty,
+                   "expiry": today + pd.Timedelta(days=TENOR_DAYS),
+                   "put_cost": pc, "put_cost_flat": pcf}
+        T = max((pos["expiry"] - today).days / 365.0, 1.0 / 365.0)
+        net = straddle_delta(S, pos["K"], T, RATE, iv_t)
+        if pos["Kp"] is not None:
+            net -= put_delta(S, pos["Kp"], T, RATE, vol_at(S, pos["Kp"], iv_t, slope_t))
+        target = round(pos["qty"] * MULT * net)
+        trade = target - shares
+        cash -= trade * S + abs(trade) * S * HEDGE_COST_BP * 1e-4
+        shares = target
+        q = pos["qty"]
+        liab = q * MULT * straddle_price(S, pos["K"], T, RATE, iv_t)
+        pv = (q * MULT * bs_put(S, pos["Kp"], T, RATE, vol_at(S, pos["Kp"], iv_t, row["slope"]))
+              if pos["Kp"] is not None else 0.0)
+        eq_rows.append({"date": today, "equity": cash + shares * S - liab + pv})
+    return pd.DataFrame(trade_rows), pd.DataFrame(eq_rows).set_index("date")["equity"]
+
+print("running backtests...")
+t_u, eq_u   = run(df, None)
+t85, eq_85  = run(df, 0.85)
+t90, eq_90  = run(df, 0.90)
+print("done")
+
+# ======================================================================
+# CHART 1 — INSURANCE: REAL SKEW vs THE FLAT-VOL ASSUMPTION
+# ======================================================================
+fig, axes = plt.subplots(2, 2, figsize=(11.5, 6.8), sharex=True)
+for col, (t, name, c_real) in enumerate([(t85, "85% put", BLUE), (t90, "90% put", VIOLET)]):
+    a = axes[0, col]
+    a.plot(t["entry_date"], t["put_cost"], color=c_real, lw=1.3,
+           label="Real skewed vol (market)")
+    a.plot(t["entry_date"], t["put_cost_flat"], color=GRAY, lw=1.2, ls="--",
+           label="Flat ATM vol (old model)")
+    a.fill_between(t["entry_date"], t["put_cost_flat"], t["put_cost"],
+                   where=t["put_cost"] >= t["put_cost_flat"], color=c_real, alpha=0.12, lw=0)
+    mult = t["put_cost"].sum() / max(t["put_cost_flat"].sum(), 1e-9)
+    a.set_title(f"{name} — flat vol made it {mult:.1f}x too cheap",
+                fontsize=10.5, loc="left", color=INK)
+    a.legend(frameon=False, fontsize=9)
+    b = axes[1, col]
+    b.plot(t["entry_date"], t["put_cost"].cumsum(), color=c_real, lw=1.6,
+           label=f"Real: ${t['put_cost'].sum():,.0f} total")
+    b.plot(t["entry_date"], t["put_cost_flat"].cumsum(), color=GRAY, lw=1.4, ls="--",
+           label=f"Flat: ${t['put_cost_flat'].sum():,.0f} total")
+    b.set_title("Cumulative spend (\\$)", fontsize=10, loc="left", color=INK)
+    b.legend(frameon=False, fontsize=9, loc="upper left")
+for a in axes.flat: style(a)
+fig.suptitle("What the constant-IV assumption hid — insurance priced by the model vs by the market",
+             fontsize=12.5, x=0.01, ha="left", color=INK)
+fig.tight_layout(rect=[0, 0, 1, 0.95])
+fig.savefig("step2_insurance_vs_flat.png", dpi=170)
+print("saved step2_insurance_vs_flat.png")
+
+# ======================================================================
+# CHART 2 — THE RUNNING NET COST OF EACH HEDGE
+# ======================================================================
+net85 = eq_u - eq_85          # dollars the hedge has cost so far (net of refunds)
+net90 = eq_u - eq_90
+fig, ax = plt.subplots(figsize=(11, 5.2))
+ax.plot(net85.index, net85.values, color=BLUE, lw=1.6,
+        label=f"85% put — net cost ended \\${net85.iloc[-1]:,.0f} "
+              f"(gross spend \\${t85['put_cost'].sum():,.0f})")
+ax.plot(net90.index, net90.values, color=VIOLET, lw=1.6,
+        label=f"90% put — net cost ended \\${net90.iloc[-1]:,.0f} "
+              f"(gross spend \\${t90['put_cost'].sum():,.0f})")
+ax.axhline(0, color="#c3c2b7", lw=0.9)
+ax.fill_between(net85.index, np.minimum(net85.values, 0), 0, color=AQUA, alpha=0.15, lw=0)
+ax.set_title("The running net cost of insurance — climbs while calm (premium bleeding), "
+             "plunges when the put pays you back", fontsize=12, loc="left", color=INK)
+ax.set_ylabel("Unhedged equity minus hedged equity (\\$)\n(above 0 = hedge has cost you; "
+              "below 0 = hedge is ahead)", fontsize=9.5, color=GRAY)
+ax.legend(frameon=False, fontsize=9.5, loc="upper left")
+style(ax)
+fig.tight_layout()
+fig.savefig("step2_hedge_net_cost.png", dpi=170)
+print("saved step2_hedge_net_cost.png")
