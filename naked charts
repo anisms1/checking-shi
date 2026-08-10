@@ -1,303 +1,214 @@
 """
-SPY 30-day implied-vol + short-straddle presentation charts
-===========================================================
+VERIFICATION STEP 1 — CHARTS (same vibe as the originals, from your master sheet)
+=================================================================================
+Self-contained: re-runs the flat-vol backtest internally from INPUT_PATH
+(same logic as verify_step1_flat.py), then draws the four presentation charts.
 
-Produces four presentation-ready PNGs (16:9, high-res) in ./charts/:
+Filenames match the deck's placeholders exactly, so you can swap them in
+directly (right-click the sample image -> Change Picture):
 
-  01_iv_100_vs_90.png       30-day IV, 100% vs 90% moneyness (the skew, over time)
-  02_skew_spread.png        90% - 100% spread (how expensive crash protection is)
-  03_equity_curve.png       strategy equity curve, flat-vol vs real-vol hedge, + drawdown
-  04_implied_vs_realized.png  ATM implied vs subsequent realized vol (the vol risk premium)
+  put_hedge_comparison.png  — equity curves + drawdown, all five variants
+  pnl_histogram.png         — distribution of monthly P&Ls   (deck slide 5)
+  iv_vs_realized.png        — implied vs realized vol         (deck slide 4)
+  crash_zoom.png            — inside the two worst months     (deck slide 8)
 
-DATA SOURCES -- set DATA_SOURCE below:
-
-  "demo"       synthetic data so the script runs anywhere (what you're previewing)
-  "excel"      reads the Bloomberg BDH export described below   <-- use this one
-  "bloomberg"  pulls live via the xbbg Python API (only works ON a terminal PC
-               with blpapi installed:  pip install blpapi xbbg)
-
-EXCEL EXPORT ("excel" mode) -- on the terminal, in one sheet, run:
-
-  A1: =BDH("SPY US Equity","30DAY_IMPVOL_100.0%MNY_DF","1/1/2008","","Dir=V","Dates=S","Days=W","Fill=P")
-  D1: =BDH("SPY US Equity","30DAY_IMPVOL_90.0%MNY_DF", "1/1/2008","","Dir=V","Dates=S","Days=W","Fill=P")
-  G1: =BDH("SPY US Equity","PX_LAST",                  "1/1/2008","","Dir=V","Dates=S","Days=W","Fill=P")
-
-  Save as spy_vols.xlsx next to this script. (Columns: A=date, B=ATM IV,
-  D=date, E=90% IV, G=date, H=SPY close. Adjust EXCEL_COLS if yours differ.)
-
-BACKTEST P&L -- point PNL_CSV at a csv exported from your backtest with columns:
-  date, pnl_flat, pnl_real     (monthly P&L in $, flat-vol hedge vs real-vol hedge)
-If the file is missing, demo P&L is simulated so the equity-curve chart still renders.
+Run:  python verify_step1_charts.py
 """
-
-from pathlib import Path
-
+import os
+import numpy as np
+import pandas as pd
+from scipy.stats import norm
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-import matplotlib.dates as mdates
-from matplotlib.ticker import FuncFormatter
-import numpy as np
-import pandas as pd
 
-# ----------------------------------------------------------------------------
-# CONFIG
-# ----------------------------------------------------------------------------
-DATA_SOURCE = "demo"                 # "demo" | "excel" | "bloomberg"
-EXCEL_FILE  = "spy_vols.xlsx"
-EXCEL_COLS  = dict(atm=("A", "B"), m90=("D", "E"), px=("G", "H"))
-PNL_FILE    = "backtest_pnl.xlsx"    # .xlsx or .csv from the backtest
-PNL_SHEET   = 0                      # sheet name or index (xlsx only)
-PNL_COLS    = dict(date="date", flat="pnl_flat", real="pnl_real")  # your column headers
-START, END  = "2008-01-01", None     # END=None -> today
-OUT_DIR     = Path("charts")
+# ----------------------------------------------------------------------
+INPUT_PATH  = "my_data.xlsx"     # <-- same master sheet as verify_step1_flat.py
+RATE        = 0.04
+TENOR_DAYS  = 30
+MULT        = 100
+PUT_PCTS    = [None, 0.90, 0.85, 0.80, 0.75]
+# ----------------------------------------------------------------------
 
-# ----------------------------------------------------------------------------
-# STYLE  (matches the earlier short-vol charts: clean, off-white, thin marks)
-# ----------------------------------------------------------------------------
-C = dict(
-    blue    = "#2a78d6",   # series 1 (ATM / flat-vol hedge)
-    orange  = "#eb6834",   # series 2 (90% mny / real-vol hedge)
-    violet  = "#4a3aa7",   # standalone series (skew spread)
-    red     = "#d03b3b",   # drawdown / stress
-    ink     = "#0b0b0b",
-    ink2    = "#52514e",
-    muted   = "#898781",
-    grid    = "#e1e0d9",
-    surface = "#fcfcfb",
-)
+BLUE, ORANGE, RED = "#2a78d6", "#eb6834", "#e34948"
+GRAY, GRID, INK = "#898781", "#e1e0d9", "#0b0b0b"
+COLORS = {"unhedged": "#8a8a8a", "put@90pct": "#4a3aa7", "put@85pct": "#2f6db3",
+          "put@80pct": "#2f9e6e", "put@75pct": "#b3532f"}
 
-plt.rcParams.update({
-    "figure.facecolor": C["surface"], "axes.facecolor": C["surface"],
-    "savefig.facecolor": C["surface"],
-    "font.family": "sans-serif", "font.size": 12,
-    "axes.edgecolor": C["grid"], "axes.linewidth": 0.8,
-    "axes.grid": True, "grid.color": C["grid"], "grid.linewidth": 0.6,
-    "axes.axisbelow": True,
-    "xtick.color": C["muted"], "ytick.color": C["muted"],
-    "axes.labelcolor": C["ink2"],
-    "axes.spines.top": False, "axes.spines.right": False,
-    "axes.spines.left": False,
-})
+def style(ax):
+    ax.grid(alpha=0.55, lw=0.5, color=GRID)
+    ax.spines[["top", "right"]].set_visible(False)
+    ax.spines[["left", "bottom"]].set_color("#c3c2b7")
+    ax.tick_params(colors=GRAY, labelsize=9)
 
+def d1(S, K, T, r, iv):
+    return (np.log(S / K) + (r + 0.5 * iv**2) * T) / (iv * np.sqrt(T))
+def bs_put(S, K, T, r, iv):
+    a = d1(S, K, T, r, iv); b = a - iv * np.sqrt(T)
+    return K * np.exp(-r * T) * norm.cdf(-b) - S * norm.cdf(-a)
+def put_delta(S, K, T, r, iv):
+    return norm.cdf(d1(S, K, T, r, iv)) - 1.0
+def straddle_price(S, K, T, r, iv):
+    a = d1(S, K, T, r, iv); b = a - iv * np.sqrt(T)
+    return (S * norm.cdf(a) - K * np.exp(-r * T) * norm.cdf(b)
+            + K * np.exp(-r * T) * norm.cdf(-b) - S * norm.cdf(-a))
+def straddle_delta(S, K, T, r, iv):
+    return 2.0 * norm.cdf(d1(S, K, T, r, iv)) - 1.0
 
-def new_fig(height=6.0):
-    fig, ax = plt.subplots(figsize=(12.8, height), dpi=200)
-    ax.grid(axis="x", visible=False)
-    ax.tick_params(length=0)
-    return fig, ax
+ext = os.path.splitext(INPUT_PATH)[1].lower()
+raw = (pd.read_excel(INPUT_PATH) if ext in (".xlsx", ".xls")
+       else pd.read_csv(INPUT_PATH)).iloc[:, :3]
+raw.columns = ["date", "spot", "iv"]
+raw["date"] = pd.to_datetime(raw["date"])
+raw["spot"] = pd.to_numeric(raw["spot"], errors="coerce")
+raw["iv"]   = pd.to_numeric(raw["iv"],   errors="coerce")
+df = (raw.dropna().loc[lambda d: d["date"].dt.dayofweek < 5]
+         .drop_duplicates(subset="date").sort_values("date").reset_index(drop=True))
+if df["iv"].median() > 3:
+    df["iv"] = df["iv"] / 100.0
 
+def run(df, put_pct):
+    cash, shares, pos, anchor = 0.0, 0, None, 0.0
+    trade_rows, eq_rows = [], []
+    for _, row in df.iterrows():
+        today, S, iv = row["date"], row["spot"], row["iv"]
+        if pos is not None and today >= pos["expiry"]:
+            cash -= MULT * abs(S - pos["K"])
+            if pos["Kp"] is not None:
+                cash += MULT * max(pos["Kp"] - S, 0.0)
+            trade_rows.append({"entry_date": pos["entry_date"],
+                               "expiry_date": today, "entry_iv": pos["iv0"],
+                               "trade_pnl": (cash + shares * S) - anchor})
+            pos = None
+        if pos is None:
+            anchor = cash + shares * S
+            K, T0 = S, TENOR_DAYS / 365.0
+            cash += MULT * straddle_price(S, K, T0, RATE, iv)
+            Kp = None
+            if put_pct is not None:
+                Kp = S * put_pct
+                cash -= MULT * bs_put(S, Kp, T0, RATE, iv)
+            pos = {"entry_date": today, "K": K, "Kp": Kp, "iv0": iv,
+                   "expiry": today + pd.Timedelta(days=TENOR_DAYS)}
+        T = max((pos["expiry"] - today).days / 365.0, 1.0 / 365.0)
+        net = straddle_delta(S, pos["K"], T, RATE, iv)
+        if pos["Kp"] is not None:
+            net -= put_delta(S, pos["Kp"], T, RATE, iv)
+        target = round(MULT * net)
+        cash -= (target - shares) * S
+        shares = target
+        liab = MULT * straddle_price(S, pos["K"], T, RATE, iv)
+        pv = MULT * bs_put(S, pos["Kp"], T, RATE, iv) if pos["Kp"] is not None else 0.0
+        eq_rows.append({"date": today, "equity": cash + shares * S - liab + pv})
+    return (pd.DataFrame(trade_rows),
+            pd.DataFrame(eq_rows).set_index("date")["equity"])
 
-def titles(ax, title, subtitle):
-    ax.text(0, 1.12, title, transform=ax.transAxes, fontsize=17,
-            fontweight="bold", color=C["ink"], va="bottom")
-    ax.text(0, 1.045, subtitle, transform=ax.transAxes, fontsize=12,
-            color=C["ink2"], va="bottom")
+def label(p): return "unhedged" if p is None else f"put@{int(p*100)}pct"
+R = {label(p): run(df, p) for p in PUT_PCTS}
+print("backtests re-run:", ", ".join(R))
 
-
-def end_label(ax, x, y, text, color, dy=0):
-    ax.annotate(text, xy=(x, y), xytext=(8, dy), textcoords="offset points",
-                color=color, fontsize=12, fontweight="bold", va="center",
-                annotation_clip=False)
-
-
-def two_end_labels(ax, x, y1, t1, c1, y2, t2, c2, min_px=20):
-    """Direct labels for two series, nudged apart if the endpoints are close."""
-    to_px = lambda y: ax.transData.transform((0, y))[1]
-    gap = to_px(y1) - to_px(y2)
-    pad = max(0.0, (min_px - abs(gap)) / 2)
-    s = 1 if gap >= 0 else -1
-    end_label(ax, x, y1, t1, c1, dy=s * pad)
-    end_label(ax, x, y2, t2, c2, dy=-s * pad)
-
-
-def save(fig, name):
-    OUT_DIR.mkdir(exist_ok=True)
-    fig.savefig(OUT_DIR / name, bbox_inches="tight", pad_inches=0.35)
-    plt.close(fig)
-    print(f"  wrote {OUT_DIR / name}")
-
-
-# ----------------------------------------------------------------------------
-# DATA
-# ----------------------------------------------------------------------------
-def load_bloomberg():
-    from xbbg import blp
-    end = END or pd.Timestamp.today().strftime("%Y-%m-%d")
-    df = blp.bdh("SPY US Equity",
-                 ["30DAY_IMPVOL_100.0%MNY_DF", "30DAY_IMPVOL_90.0%MNY_DF", "PX_LAST"],
-                 START, end)
-    df.columns = ["iv_atm", "iv_90", "px"]
-    return df.dropna(subset=["iv_atm", "iv_90"])
-
-
-def load_excel():
-    def block(datecol, valcol, name):
-        s = pd.read_excel(EXCEL_FILE, usecols=f"{datecol},{valcol}", header=None,
-                          names=["date", name]).dropna()
-        s["date"] = pd.to_datetime(s["date"])
-        return s.set_index("date")[name]
-    df = pd.concat([block(*EXCEL_COLS["atm"], "iv_atm"),
-                    block(*EXCEL_COLS["m90"], "iv_90"),
-                    block(*EXCEL_COLS["px"],  "px")], axis=1)
-    return df.dropna(subset=["iv_atm", "iv_90"]).sort_index()
-
-
-def load_demo():
-    """Synthetic but realistic vol series: mean-reverting ATM vol with crisis
-    spikes; 90% moneyness IV = ATM + a skew premium that widens under stress."""
-    rng = np.random.default_rng(7)
-    dates = pd.bdate_range(START, END or pd.Timestamp("2026-08-07"))
-    n = len(dates)
-
-    x = np.zeros(n); x[0] = np.log(20)
-    for t in range(1, n):                      # OU in log-vol
-        x[t] = x[t-1] + 0.015 * (np.log(16) - x[t-1]) + 0.045 * rng.standard_normal()
-    iv = np.exp(x)
-    for d0, d1, peak in [("2008-09-01", "2009-03-01", 62), ("2010-05-01", "2010-06-15", 38),
-                         ("2011-08-01", "2011-11-01", 42), ("2015-08-20", "2015-09-15", 36),
-                         ("2018-02-05", "2018-03-01", 33), ("2018-12-01", "2019-01-05", 30),
-                         ("2020-02-24", "2020-05-01", 68), ("2022-01-15", "2022-10-15", 32),
-                         ("2024-08-05", "2024-08-20", 34), ("2025-04-03", "2025-05-01", 45)]:
-        m = (dates >= d0) & (dates <= d1)
-        k = m.sum()
-        if k:
-            bump = peak * np.exp(-3.5 * np.linspace(0, 1, k)) * np.linspace(1, 0.35, k)
-            iv[m] = np.maximum(iv[m], iv[m] + bump * rng.uniform(0.55, 1.0, k))
-    iv = pd.Series(iv, index=dates).rolling(3).mean().bfill().clip(9, 85)
-
-    skew = (3.2 + 0.14 * (iv - 14).clip(lower=0)
-            + pd.Series(0.5 * rng.standard_normal(n), index=dates).rolling(15).mean().bfill())
-    ret = pd.Series(rng.standard_normal(n), index=dates) * (iv.shift(1).bfill() / 100 / np.sqrt(252)) * 0.85
-    px = 100 * np.exp(ret.cumsum()) * (450 / 100)
-    return pd.DataFrame({"iv_atm": iv, "iv_90": iv + skew, "px": px})
-
-
-def load_pnl(df):
-    """Monthly backtest P&L: real file if present, else simulated from the vol
-    series (short straddle keeps carry, loses when realized outruns implied)."""
-    p = Path(PNL_FILE)
-    if p.exists():
-        if p.suffix.lower() in (".xlsx", ".xlsm", ".xls"):
-            raw = pd.read_excel(p, sheet_name=PNL_SHEET)
-        else:
-            raw = pd.read_csv(p)
-        raw.columns = [str(c).strip() for c in raw.columns]
-        pnl = pd.DataFrame({
-            "pnl_flat": raw[PNL_COLS["flat"]].values,
-            "pnl_real": raw[PNL_COLS["real"]].values,
-        }, index=pd.to_datetime(raw[PNL_COLS["date"]]))
-        return pnl.sort_index().dropna()
-
-    rng = np.random.default_rng(11)
-    rv = np.log(df["px"]).diff().rolling(21).std() * np.sqrt(252) * 100
-    m_iv = df["iv_atm"].resample("ME").first()
-    m_rv = rv.shift(-21).resample("ME").first()           # realized over the trade
-    edge = (m_iv - m_rv).dropna()                          # vol pts; negative when rv beats iv
-    carry = 78 + 30 * rng.standard_normal(len(edge))       # normal month: keep most of the premium
-    loss = np.where(edge < 0, 120 * edge, 0.0)             # crash month: lose a multiple of it
-    flat = carry + loss
-    real = flat - 16 + np.where(loss < -400, 0.38 * (-loss - 400), 0)  # put costs more, pays in crashes
-    return pd.DataFrame({"pnl_flat": flat, "pnl_real": real}, index=edge.index)
-
-
-# ----------------------------------------------------------------------------
-# CHARTS
-# ----------------------------------------------------------------------------
-def chart_iv_levels(df):
-    fig, ax = new_fig()
-    ax.plot(df.index, df["iv_90"], color=C["orange"], lw=1.6)
-    ax.plot(df.index, df["iv_atm"], color=C["blue"], lw=1.6)
-    end_label(ax, df.index[-1], df["iv_90"].iloc[-1], "90% mny", C["orange"], dy=8)
-    end_label(ax, df.index[-1], df["iv_atm"].iloc[-1], "100% mny (ATM)", C["blue"], dy=-8)
-    ax.yaxis.set_major_formatter(FuncFormatter(lambda v, _: f"{v:.0f}%"))
-    ax.xaxis.set_major_locator(mdates.YearLocator(2))
-    ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y"))
-    titles(ax, "SPY 30-day implied volatility: 90% vs 100% moneyness",
-           "Downside strikes always trade at a vol premium — the skew your crash puts are bought on  ·  Bloomberg 30DAY_IMPVOL_*%MNY_DF")
-    save(fig, "01_iv_100_vs_90.png")
-
-
-def chart_skew_spread(df):
-    spread = df["iv_90"] - df["iv_atm"]
-    fig, ax = new_fig(5.6)
-    ax.fill_between(df.index, spread, spread.mean(), color=C["violet"], alpha=0.12, lw=0)
-    ax.plot(df.index, spread, color=C["violet"], lw=1.4)
-    ax.axhline(spread.mean(), color=C["muted"], lw=1, ls=(0, (4, 3)))
-    ax.text(df.index[3], spread.mean(), f" avg {spread.mean():.1f} pts",
-            color=C["muted"], fontsize=11, va="bottom")
-    t = spread.idxmax()
-    ax.annotate(f"{spread.max():.1f} pts", xy=(t, spread.max()),
-                xytext=(12, 6), textcoords="offset points",
-                color=C["violet"], fontsize=11, fontweight="bold")
-    ax.yaxis.set_major_formatter(FuncFormatter(lambda v, _: f"{v:.0f}"))
-    ax.set_ylabel("vol points, 90% − 100%")
-    ax.xaxis.set_major_locator(mdates.YearLocator(2))
-    ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y"))
-    titles(ax, "The skew premium: what crash protection costs",
-           "90% − 100% moneyness IV spread — pricing the 85% put off flat ATM vol ignores all of this")
-    save(fig, "02_skew_spread.png")
-
-
-def chart_equity_curve(pnl):
-    eq = pnl.cumsum()
+# ======================================================================
+# CHART 1 — EQUITY + DRAWDOWN, ALL VARIANTS
+# ======================================================================
+fig, (a1, a2) = plt.subplots(2, 1, figsize=(11, 8), sharex=True,
+                             gridspec_kw={"height_ratios": [3, 1]})
+for name, (_, eq) in R.items():
+    a1.plot(eq.index, eq.values, lw=1.4, color=COLORS[name], label=name, alpha=0.9)
     dd = eq - eq.cummax()
-    fig, (ax, axd) = plt.subplots(
-        2, 1, figsize=(12.8, 7.2), dpi=200, sharex=True,
-        gridspec_kw=dict(height_ratios=[3, 1], hspace=0.08))
-    for a in (ax, axd):
-        a.grid(axis="x", visible=False)
-        a.tick_params(length=0)
+    a2.plot(dd.index, dd.values, lw=1.0, color=COLORS[name], alpha=0.9)
+a1.axhline(0, color="#999999", lw=0.7)
+a1.set_title("Short 30-Day SPY Straddle, Delta-Hedged, With/Without Crash Puts — Equity (\\$)",
+             fontsize=11, loc="left", color=INK)
+a1.legend(frameon=False, fontsize=9)
+a2.set_title("Drawdown from peak (\\$)", fontsize=10, loc="left", color=INK)
+for a in (a1, a2): style(a)
+fig.tight_layout()
+fig.savefig("put_hedge_comparison.png", dpi=150)
+print("saved put_hedge_comparison.png")
 
-    ax.plot(eq.index, eq["pnl_flat"], color=C["blue"], lw=1.8)
-    ax.plot(eq.index, eq["pnl_real"], color=C["orange"], lw=1.8)
-    two_end_labels(ax, eq.index[-1],
-                   eq["pnl_flat"].iloc[-1], "flat-vol hedge", C["blue"],
-                   eq["pnl_real"].iloc[-1], "real-vol hedge", C["orange"])
-    ax.axhline(0, color=C["muted"], lw=0.8)
-    ax.yaxis.set_major_formatter(FuncFormatter(lambda v, _: f"${v:,.0f}"))
-    titles(ax, "Short 30-day SPY straddle, delta-hedged, 85% crash put",
-           "Cumulative P&L, $1,000 premium sold monthly — put priced at flat ATM vol vs real 85%-moneyness vol")
+# ======================================================================
+# CHART 2 — P&L HISTOGRAM (unhedged)
+# ======================================================================
+trades_u, _ = R["unhedged"]
+pnl = trades_u["trade_pnl"]
+fig, ax = plt.subplots(figsize=(8, 4.8))
+counts, bins, patches = ax.hist(pnl, bins=40, edgecolor="white", lw=0.6)
+for patch, left in zip(patches, bins[:-1]):
+    patch.set_facecolor(BLUE if left >= 0 else RED)
+ax.axvline(0, color="#c3c2b7", lw=0.8)
+ax.axvline(pnl.mean(), color=INK, lw=1.2, ls="--")
+ax.annotate(f"avg  ${pnl.mean():,.0f}/trade", xy=(pnl.mean(), ax.get_ylim()[1]*0.92),
+            xytext=(10, 0), textcoords="offset points", fontsize=10, color=INK)
+ax.annotate(f"worst  ${pnl.min():,.0f}", xy=(pnl.min(), 1.5), xytext=(0, 28),
+            textcoords="offset points", fontsize=10, color=RED, ha="left",
+            arrowprops=dict(arrowstyle="-", color=RED, lw=0.8))
+ax.set_title(f"The personality of short volatility — {len(pnl)} monthly trades, "
+             f"{(pnl > 0).mean():.0%} winners", fontsize=12, loc="left", color=INK)
+ax.set_xlabel("Trade P&L (\\$, per 1 straddle)", fontsize=10, color=GRAY)
+ax.set_ylabel("Number of months", fontsize=10, color=GRAY)
+ax.yaxis.set_major_locator(plt.MaxNLocator(integer=True))
+style(ax)
+fig.tight_layout()
+fig.savefig("pnl_histogram.png", dpi=180)
+print("saved pnl_histogram.png")
 
-    axd.fill_between(dd.index, dd["pnl_real"], 0, color=C["red"], alpha=0.25, lw=0)
-    axd.plot(dd.index, dd["pnl_real"], color=C["red"], lw=1.2)
-    axd.yaxis.set_major_formatter(FuncFormatter(lambda v, _: f"${v:,.0f}"))
-    axd.set_ylabel("drawdown", fontsize=11)
-    axd.xaxis.set_major_locator(mdates.YearLocator(2))
-    axd.xaxis.set_major_formatter(mdates.DateFormatter("%Y"))
-    save(fig, "03_equity_curve.png")
+# ======================================================================
+# CHART 3 — IMPLIED VS REALIZED VOL
+# ======================================================================
+spy = df.set_index("date")
+spy["logret"] = np.log(spy["spot"]).diff()
+def realized_vol(a, b):
+    r = spy.loc[a:b, "logret"].dropna()
+    return r.std() * np.sqrt(252) if len(r) >= 5 else np.nan
+t = trades_u.copy()
+t["realized"] = [realized_vol(a, b) for a, b in zip(t["entry_date"], t["expiry_date"])]
+t = t.dropna(subset=["realized"])
+gap = t["entry_iv"] - t["realized"]
+fig, ax = plt.subplots(figsize=(9, 4.8))
+ax.plot(t["entry_date"], t["entry_iv"]*100, color=BLUE, lw=1.5, label="Implied vol at entry")
+ax.plot(t["entry_date"], t["realized"]*100, color=ORANGE, lw=1.5, alpha=0.9,
+        label="Realized vol during the trade")
+ax.fill_between(t["entry_date"], t["entry_iv"]*100, t["realized"]*100,
+                where=t["entry_iv"] > t["realized"], color=BLUE, alpha=0.12, lw=0)
+ax.set_title(f"The edge, made visible — implied exceeded realized in "
+             f"{(gap > 0).mean():.0%} of months (avg gap {gap.mean()*100:.1f} vol pts)",
+             fontsize=12, loc="left", color=INK)
+ax.set_ylabel("Volatility (%, annualized)", fontsize=10, color=GRAY)
+ax.legend(frameon=False, fontsize=10, loc="upper left")
+style(ax)
+fig.tight_layout()
+fig.savefig("iv_vs_realized.png", dpi=180)
+print("saved iv_vs_realized.png")
 
-
-def chart_implied_vs_realized(df):
-    rv = np.log(df["px"]).diff().rolling(21).std() * np.sqrt(252) * 100
-    rv_fwd = rv.shift(-21)                       # realized over the NEXT month
-    m = pd.DataFrame({"iv": df["iv_atm"], "rv": rv_fwd}).resample("W").mean().dropna()
-    fig, ax = new_fig()
-    ax.fill_between(m.index, m["rv"], m["iv"], where=m["iv"] >= m["rv"],
-                    color=C["blue"], alpha=0.10, lw=0)
-    ax.plot(m.index, m["iv"], color=C["blue"], lw=1.6)
-    ax.plot(m.index, m["rv"], color=C["muted"], lw=1.2)
-    end_label(ax, m.index[-1], m["iv"].iloc[-1], "implied (30d)", C["blue"], dy=8)
-    end_label(ax, m.index[-1], m["rv"].iloc[-1], "realized (next 30d)", C["muted"], dy=-8)
-    prem = (m["iv"] - m["rv"]).mean()
-    share = (m["iv"] > m["rv"]).mean()
-    ax.yaxis.set_major_formatter(FuncFormatter(lambda v, _: f"{v:.0f}%"))
-    ax.xaxis.set_major_locator(mdates.YearLocator(2))
-    ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y"))
-    titles(ax, "Why the strategy earns carry: the volatility risk premium",
-           f"Implied above subsequent realized {share:.0%} of the time, avg gap {prem:.1f} vol pts — the premium the straddle seller collects")
-    save(fig, "04_implied_vs_realized.png")
-
-
-# ----------------------------------------------------------------------------
-if __name__ == "__main__":
-    loaders = {"demo": load_demo, "excel": load_excel, "bloomberg": load_bloomberg}
-    print(f"loading data ({DATA_SOURCE}) ...")
-    df = loaders[DATA_SOURCE]()
-    pnl = load_pnl(df)
-    print(f"{len(df)} days of vol data, {len(pnl)} months of P&L")
-    chart_iv_levels(df)
-    chart_skew_spread(df)
-    chart_equity_curve(pnl)
-    chart_implied_vs_realized(df)
-    print("done.")
+# ======================================================================
+# CHART 4 — INSIDE THE TWO WORST MONTHS (unhedged vs 90% vs 85%)
+# ======================================================================
+worst2 = trades_u.nsmallest(2, "trade_pnl").sort_values("entry_date")
+fig, axes = plt.subplots(2, 2, figsize=(10, 5.6), sharex="col",
+                         gridspec_kw={"height_ratios": [1, 1.4]})
+for col, (_, tr) in enumerate(worst2.iterrows()):
+    a, b = tr["entry_date"] - pd.Timedelta(days=15), tr["expiry_date"] + pd.Timedelta(days=20)
+    s = spy.loc[a:b, "spot"]
+    ax_s, ax_e = axes[0, col], axes[1, col]
+    ax_s.plot(s.index, s.values, color=INK, lw=1.3)
+    ax_s.axvspan(tr["entry_date"], tr["expiry_date"], color=RED, alpha=0.06, lw=0)
+    ax_s.set_title(f"{tr['entry_date']:%b %Y} — trade lost ${-tr['trade_pnl']:,.0f}",
+                   fontsize=11, loc="left", color=INK)
+    for name, lab in [("unhedged", "Unhedged"), ("put@90pct", "With 90% put"),
+                      ("put@85pct", "With 85% put")]:
+        _, eq = R[name]
+        e = eq.loc[a:b]; e = e - e.iloc[0]
+        ax_e.plot(e.index, e.values, color=COLORS[name], lw=1.5, label=lab)
+    ax_e.axhline(0, color="#c3c2b7", lw=0.7)
+    for ax in (ax_s, ax_e):
+        style(ax)
+        ax.tick_params(axis="x", rotation=30)
+    if col == 0:
+        ax_s.set_ylabel("SPY", fontsize=10, color=GRAY)
+        ax_e.set_ylabel("Equity change (\\$)", fontsize=10, color=GRAY)
+        ax_e.legend(frameon=False, fontsize=9, loc="lower left")
+fig.suptitle("Inside the two worst months — what the crash puts actually did",
+             fontsize=12, x=0.01, ha="left", color=INK)
+fig.tight_layout(rect=[0, 0, 1, 0.96])
+fig.savefig("crash_zoom.png", dpi=180)
+print("saved crash_zoom.png")
