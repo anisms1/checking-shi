@@ -1,0 +1,199 @@
+"""
+VERIFICATION STEP 4 — THE VRP SIGNAL (enter rich, exit when it inverts)
+=======================================================================
+Adds a timing signal to the upgraded UNHEDGED strategy ($1,000 premium,
+0.1bp hedge costs, from your master sheet A=date, B=spot, C=ATM vol):
+
+  THE GAP  =  implied vol (today's 30-day ATM)  -  realized vol (trailing
+              ~30 calendar days = last 21 trading days of returns, annualized)
+
+  ENTER  only when GAP > threshold  (you're only paid to sell vol when
+         it's actually trading above what the market has been doing)
+  EXIT   early — buy the straddle back at its market value and unwind the
+         hedge — the first day realized SURPASSES implied (GAP < 0),
+         instead of holding to expiry
+  WAIT   in cash whenever flat and the entry condition isn't met
+
+VARIANTS
+  always-in            no signal (your step-2 unhedged baseline)
+  gap > 0.0%           enter whenever implied exceeds realized at all
+  gap > 0.5%           ... by half a vol point
+  gap > 1.0%           ... by one vol point
+  gap > 2.0%           ... by two vol points
+
+NOTES ON HONESTY
+  - Realized vol uses ONLY past returns (trailing window ending today) —
+    no lookahead. But the thresholds were chosen by us, today, knowing
+    history: treat this as exploration, and say so. The clean test is
+    fitting the threshold on the first half and testing on the second.
+  - Time in market differs by variant, so raw total P&L is not the fair
+    comparison — P&L per month IN MARKET and the ratios are.
+
+Run:  python verify_step4_signal.py
+Outputs: comparison table + step4_signal.png + step4_trades_*.csv
+"""
+import os
+import numpy as np
+import pandas as pd
+from scipy.stats import norm
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+# ----------------------------------------------------------------------
+INPUT_PATH      = "my_data.xlsx"     # <-- your master sheet
+RATE            = 0.04
+TENOR_DAYS      = 30
+MULT            = 100
+TARGET_PREMIUM  = 1000.0
+HEDGE_COST_BP   = 0.1
+RV_WINDOW       = 21                 # trading days of trailing realized vol (~30 calendar)
+THRESHOLDS      = [None, 0.000, 0.005, 0.010, 0.020]   # None = always-in baseline
+EXIT_WHEN_GAP_BELOW = 0.0            # exit when (IV - RV) drops below this
+# ----------------------------------------------------------------------
+
+def d1(S, K, T, r, iv):
+    return (np.log(S / K) + (r + 0.5 * iv**2) * T) / (iv * np.sqrt(T))
+def straddle_price(S, K, T, r, iv):
+    a = d1(S, K, T, r, iv); b = a - iv * np.sqrt(T)
+    return (S * norm.cdf(a) - K * np.exp(-r * T) * norm.cdf(b)
+            + K * np.exp(-r * T) * norm.cdf(-b) - S * norm.cdf(-a))
+def straddle_delta(S, K, T, r, iv):
+    return 2.0 * norm.cdf(d1(S, K, T, r, iv)) - 1.0
+
+ext = os.path.splitext(INPUT_PATH)[1].lower()
+raw = (pd.read_excel(INPUT_PATH) if ext in (".xlsx", ".xls")
+       else pd.read_csv(INPUT_PATH)).iloc[:, :3]
+raw.columns = ["date", "spot", "iv"]
+raw["date"] = pd.to_datetime(raw["date"])
+raw["spot"] = pd.to_numeric(raw["spot"], errors="coerce")
+raw["iv"]   = pd.to_numeric(raw["iv"],   errors="coerce")
+df = (raw.dropna().loc[lambda d: d["date"].dt.dayofweek < 5]
+         .drop_duplicates(subset="date").sort_values("date").reset_index(drop=True))
+if df["iv"].median() > 3:
+    df["iv"] = df["iv"] / 100.0
+
+# trailing realized vol (annualized), PAST returns only
+df["rv"] = (np.log(df["spot"]).diff().rolling(RV_WINDOW).std() * np.sqrt(252))
+df["gap"] = df["iv"] - df["rv"]
+valid = df["gap"].notna()
+print(f"Loaded {len(df)} days: {df.date.iloc[0].date()} to {df.date.iloc[-1].date()}")
+print(f"IV - RV gap: median {df['gap'].median()*100:+.1f} vol pts | "
+      f"positive on {(df.loc[valid,'gap']>0).mean():.0%} of days")
+
+def run(df, threshold):
+    """threshold=None -> always in (enter every roll). Else signal-gated."""
+    cash, shares, pos, anchor = 0.0, 0, None, 0.0
+    trade_rows, eq_rows = [], []
+    for _, row in df.iterrows():
+        today, S, iv, gap = row["date"], row["spot"], row["iv"], row["gap"]
+
+        # ---- exits ----------------------------------------------------
+        if pos is not None:
+            expiry_hit = today >= pos["expiry"]
+            signal_out = (threshold is not None and not np.isnan(gap)
+                          and gap < EXIT_WHEN_GAP_BELOW)
+            if expiry_hit or signal_out:
+                q = pos["qty"]
+                if expiry_hit:
+                    cash -= q * MULT * abs(S - pos["K"])              # settle intrinsic
+                else:
+                    T = max((pos["expiry"] - today).days / 365.0, 1.0/365.0)
+                    cash -= q * MULT * straddle_price(S, pos["K"], T, RATE, iv)  # buy back
+                cost = abs(shares) * S * HEDGE_COST_BP * 1e-4         # unwind hedge
+                cash += shares * S - cost
+                shares = 0
+                trade_rows.append({"entry_date": pos["entry_date"], "exit_date": today,
+                                   "exit_type": "expiry" if expiry_hit else "signal",
+                                   "trade_pnl": (cash) - anchor})
+                pos = None
+
+        # ---- entries --------------------------------------------------
+        if pos is None:
+            ok = (threshold is None) or ((not np.isnan(gap)) and gap > threshold)
+            if ok:
+                anchor = cash + shares * S
+                K, T0 = S, TENOR_DAYS / 365.0
+                qty = TARGET_PREMIUM / (straddle_price(S, K, T0, RATE, iv) * MULT)
+                cash += TARGET_PREMIUM
+                pos = {"entry_date": today, "K": K, "qty": qty,
+                       "expiry": today + pd.Timedelta(days=TENOR_DAYS)}
+
+        # ---- hedge + mark --------------------------------------------
+        if pos is not None:
+            T = max((pos["expiry"] - today).days / 365.0, 1.0 / 365.0)
+            target = round(pos["qty"] * MULT * straddle_delta(S, pos["K"], T, RATE, iv))
+            trade = target - shares
+            cash -= trade * S + abs(trade) * S * HEDGE_COST_BP * 1e-4
+            shares = target
+            liab = pos["qty"] * MULT * straddle_price(S, pos["K"], T, RATE, iv)
+        else:
+            liab = 0.0
+        eq_rows.append({"date": today, "equity": cash + shares * S - liab,
+                        "in_mkt": pos is not None})
+    daily = pd.DataFrame(eq_rows).set_index("date")
+    return pd.DataFrame(trade_rows), daily
+
+def label(t): return "always-in" if t is None else f"gap>{t*100:.1f}%"
+R = {}
+for t in THRESHOLDS:
+    trades, daily = run(df, t)
+    trades.to_csv(f"step4_trades_{label(t).replace('>','_')}.csv", index=False)
+    R[label(t)] = (trades, daily)
+    print(f"Ran: {label(t)}  ({len(trades)} trades, "
+          f"{daily['in_mkt'].mean():.0%} of days in market)")
+
+def ratios(t, d):
+    pnl = t["trade_pnl"]; eq = d["equity"]
+    years = (eq.index[-1] - eq.index[0]).days / 365.25
+    maxdd = (eq - eq.cummax()).min()
+    losers = pnl[pnl < 0]
+    trades_per_yr = len(pnl) / years
+    sharpe  = pnl.mean()/pnl.std()*np.sqrt(trades_per_yr) if pnl.std() > 0 else np.nan
+    sortino = pnl.mean()/losers.std()*np.sqrt(trades_per_yr) if len(losers) > 1 else np.nan
+    calmar  = (eq.iloc[-1]/years)/abs(maxdd) if maxdd < 0 else np.nan
+    return sharpe, sortino, calmar
+
+names = list(R)
+print(f"\n===== STEP 4: THE IV-vs-RV SIGNAL (unhedged, $1,000/mo, 0.1bp costs) =====")
+print(f"{'':26s}" + "".join(f"{n:>13s}" for n in names))
+def rowp(lbl, fn, fmt="{:>13,.0f}"):
+    print(f"{lbl:26s}" + "".join(fmt.format(fn(*R[n])) for n in names))
+rowp("Trades",                lambda t, d: len(t))
+rowp("Early (signal) exits",  lambda t, d: (t["exit_type"] == "signal").sum())
+rowp("% of days in market",   lambda t, d: d["in_mkt"].mean(), "{:>13.0%}")
+rowp("Total P&L ($)",         lambda t, d: d["equity"].iloc[-1])
+rowp("P&L per trade ($)",     lambda t, d: t["trade_pnl"].mean())
+rowp("P&L per mkt-month ($)", lambda t, d: d["equity"].iloc[-1] / max(d["in_mkt"].sum()/21, 1))
+rowp("Win rate",              lambda t, d: (t["trade_pnl"] > 0).mean(), "{:>13.1%}")
+rowp("Worst trade ($)",       lambda t, d: t["trade_pnl"].min())
+rowp("Max drawdown ($)",      lambda t, d: (d["equity"] - d["equity"].cummax()).min())
+rowp("Sharpe (ann.)",         lambda t, d: ratios(t, d)[0], "{:>13.2f}")
+rowp("Sortino (ann.)",        lambda t, d: ratios(t, d)[1], "{:>13.2f}")
+rowp("Calmar",                lambda t, d: ratios(t, d)[2], "{:>13.2f}")
+print("\n(Sharpe/Sortino annualized by each variant's actual trades-per-year; "
+      "P&L per mkt-month uses 21-trading-day months.)")
+
+# ---- chart ------------------------------------------------------------
+colors = {"always-in": "#8a8a8a", "gap>0.0%": "#2a78d6", "gap>0.5%": "#1baf7a",
+          "gap>1.0%": "#eda100", "gap>2.0%": "#b3532f"}
+fig, (a1, a2) = plt.subplots(2, 1, figsize=(11, 7.2), sharex=True,
+                             gridspec_kw={"height_ratios": [3, 1]})
+for name, (_, d) in R.items():
+    a1.plot(d.index, d["equity"], lw=1.4, color=colors[name], label=name)
+a1.axhline(0, color="#c3c2b7", lw=0.7)
+a1.set_title("The VRP timing signal — equity (\\$), unhedged strategy", fontsize=11.5, loc="left")
+a1.legend(frameon=False, fontsize=9)
+gap_pts = df.set_index("date")["gap"] * 100
+a2.plot(gap_pts.index, gap_pts.values, color="#52514E", lw=0.8)
+a2.axhline(0, color="#e34948", lw=0.9)
+a2.fill_between(gap_pts.index, gap_pts.values, 0, where=gap_pts.values < 0,
+                color="#e34948", alpha=0.18, lw=0)
+a2.set_title("The signal itself: implied minus trailing realized vol (pts) — "
+             "red = inverted (stay out / exit)", fontsize=10, loc="left")
+for a in (a1, a2):
+    a.grid(alpha=0.3, lw=0.5)
+    a.spines[["top", "right"]].set_visible(False)
+fig.tight_layout()
+fig.savefig("step4_signal.png", dpi=170)
+print("Saved: step4_signal.png, step4_trades_*.csv")
